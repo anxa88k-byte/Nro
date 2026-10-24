@@ -1,0 +1,228 @@
+name: Build iOS IPA
+on:
+  workflow_dispatch:
+    inputs:
+      method:
+        description: "unsigned | development | ad-hoc | app-store-connect"
+        required: true
+        default: unsigned
+        type: choice
+        options:
+          - unsigned
+          - development
+          - ad-hoc
+          - app-store-connect
+      upload_id:
+        description: "ID of the uploaded Xcode archive (leave empty for source already in the repository)"
+        required: false
+        type: string
+      archive_type:
+        description: "zip or rar"
+        required: false
+        default: zip
+        type: choice
+        options:
+          - zip
+          - rar
+      ipa_name:
+        description: "Output IPA filename without extension"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    # macos-15 (arm64) thay cho macos-14: GitHub khai tu image macos-14 / macos-15-intel tu 2/11/2026.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true # libiPhone-lib.a (196MB) / libil2cpp.a (65MB) duoc luu bang Git LFS
+          persist-credentials: false
+
+      - name: Download uploaded Xcode project
+        if: inputs.upload_id != ''
+        env:
+          UPLOAD_ID: ${{ inputs.upload_id }}
+          ARCHIVE_TYPE: ${{ inputs.archive_type }}
+          UPLOAD_SERVICE_URL: ${{ secrets.UPLOAD_SERVICE_URL }}
+          UPLOAD_SERVICE_TOKEN: ${{ secrets.UPLOAD_SERVICE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$UPLOAD_SERVICE_URL" || -z "$UPLOAD_SERVICE_TOKEN" ]]; then
+            echo "::error::Configure UPLOAD_SERVICE_URL and UPLOAD_SERVICE_TOKEN repository secrets."
+            exit 1
+          fi
+          if [[ "$ARCHIVE_TYPE" != "zip" && "$ARCHIVE_TYPE" != "rar" ]]; then
+            echo "::error::Unsupported source archive type."
+            exit 1
+          fi
+          UPLOAD_SERVICE_URL="${UPLOAD_SERVICE_URL%/}"
+          python3 - "$UPLOAD_ID" <<'PY'
+          import re, sys
+          if not re.fullmatch(r"[0-9a-f]{32}", sys.argv[1]):
+              raise SystemExit("Invalid upload ID")
+          PY
+          mkdir -p "$RUNNER_TEMP/ipa-source" "$RUNNER_TEMP/ipa-unpacked"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $UPLOAD_SERVICE_TOKEN" \
+            "$UPLOAD_SERVICE_URL/api/files/$UPLOAD_ID" \
+            -o "$RUNNER_TEMP/ipa-source/project.$ARCHIVE_TYPE"
+          if [[ "$ARCHIVE_TYPE" == "rar" ]]; then
+            brew install --quiet unar
+            if ! unar -p '' -o "$RUNNER_TEMP/ipa-unpacked" "$RUNNER_TEMP/ipa-source/project.rar"; then
+              echo "::error::Could not extract this RAR. It may be damaged, unsupported, or password-protected."
+              exit 1
+            fi
+          else
+            python3 - "$RUNNER_TEMP/ipa-source/project.zip" "$RUNNER_TEMP/ipa-unpacked" <<'PY'
+          import pathlib, sys, zipfile
+          archive, dest = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as z:
+              if len(z.infolist()) > 100000 or sum(i.file_size for i in z.infolist()) > 5 * 1024**3:
+                  raise SystemExit("ZIP contains too many files or exceeds the 5 GB extracted-size limit")
+              for item in z.infolist():
+                  target = (dest / item.filename).resolve()
+                  if target != dest and dest not in target.parents:
+                      raise SystemExit("ZIP contains a path outside the project directory")
+              z.extractall(dest)
+          PY
+          fi
+          PROJECT=$(find "$RUNNER_TEMP/ipa-unpacked" -type d \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) -print -quit)
+          if [[ -z "$PROJECT" ]]; then
+            echo "::error::Archive must contain an .xcworkspace or .xcodeproj"
+            exit 1
+          fi
+          echo "PROJECT_PATH=$PROJECT" >> "$GITHUB_ENV"
+
+      - name: Find Xcode project in repository
+        if: inputs.upload_id == ''
+        run: |
+          set -euo pipefail
+          if [[ -f .ipa-forge-project ]]; then
+            PROJECT_ITEM="$(cat .ipa-forge-project)"
+            if [[ "$PROJECT_ITEM" == */* || ( "$PROJECT_ITEM" != *.xcodeproj && "$PROJECT_ITEM" != *.xcworkspace ) ]]; then
+              echo "::error::Invalid .ipa-forge-project marker."
+              exit 1
+            fi
+            PROJECT="$GITHUB_WORKSPACE/$PROJECT_ITEM"
+            if [[ ! -d "$PROJECT" ]]; then
+              echo "::error::Could not find the Xcode project named in .ipa-forge-project."
+              exit 1
+            fi
+          else
+            PROJECT=$(find "$GITHUB_WORKSPACE" -type d \
+              \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) \
+              -not -path '*/.git/*' -print -quit)
+          fi
+          if [[ -z "$PROJECT" ]]; then
+            echo "::error::Repository must contain an .xcworkspace or .xcodeproj."
+            exit 1
+          fi
+          echo "PROJECT_PATH=$PROJECT" >> "$GITHUB_ENV"
+
+      - name: Set IPA output name
+        id: set-ipa-name
+        env:
+          IPA_NAME_INPUT: ${{ inputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          IPA_NAME="$IPA_NAME_INPUT"
+          if [[ -z "$IPA_NAME" && -f .ipa-forge-name ]]; then
+            IPA_NAME="$(cat .ipa-forge-name)"
+          fi
+          IPA_NAME="${IPA_NAME:-ipa}"
+          IPA_NAME="${IPA_NAME%.[iI][pP][aA]}"
+          if [[ ! "$IPA_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            echo "::error::Invalid IPA name. Use 1-64 letters, numbers, dots, dashes, or underscores."
+            exit 1
+          fi
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          echo "name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+
+      # Tai lai vat the LFS va kiem tra file that (tranh truong hop con pointer).
+      - name: Kiem tra thu vien da tai du chua
+        if: inputs.upload_id == ''
+        run: |
+          if [[ ! -d Unity-iPhone.xcodeproj ]]; then
+            echo "No Unity static libraries required for this Xcode project."
+            exit 0
+          fi
+          for lib in Libraries/libiPhone-lib.a Libraries/libil2cpp.a; do
+            if [ "$(head -c 8 "$lib")" != '!<arch>' ]; then
+              echo "::error::$lib khong phai file ar that - chua tai duoc tu Git LFS"
+              exit 1
+            fi
+          done
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build IPA
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          BUNDLE_ID: app.pink8905.cyan5188
+        run: bash ios-build/build-ipa.sh "${{ inputs.method }}"
+
+      - name: Set IPA Bundle ID for eSign
+        if: inputs.method == 'unsigned'
+        env:
+          IPA_BUNDLE_ID: com.Sourcenro.Online
+        run: |
+          python3 <<'PY'
+          import copy
+          import os
+          import pathlib
+          import plistlib
+          import tempfile
+          import zipfile
+
+          expected = os.environ["IPA_BUNDLE_ID"]
+          ipa_files = list(pathlib.Path("ios-build/out").glob("*.ipa"))
+          if not ipa_files:
+              raise SystemExit("No unsigned IPA found to prepare for eSign.")
+
+          for ipa in ipa_files:
+              with zipfile.ZipFile(ipa, "r") as source:
+                  app_plist = next(
+                      (entry for entry in source.infolist()
+                       if entry.filename.startswith("Payload/")
+                       and entry.filename.count("/") == 2
+                       and entry.filename.endswith(".app/Info.plist")),
+                      None,
+                  )
+                  if app_plist is None:
+                      raise SystemExit(f"Could not find the main app Info.plist in {ipa.name}.")
+                  info = plistlib.loads(source.read(app_plist))
+                  info["CFBundleIdentifier"] = expected
+                  updated_plist = plistlib.dumps(info, sort_keys=False)
+
+                  with tempfile.NamedTemporaryFile(
+                      dir=ipa.parent, prefix=ipa.stem + ".", suffix=".tmp", delete=False
+                  ) as temp:
+                      temp_path = pathlib.Path(temp.name)
+                  try:
+                      with zipfile.ZipFile(temp_path, "w") as output:
+                          output.comment = source.comment
+                          for entry in source.infolist():
+                              payload = updated_plist if entry.filename == app_plist.filename else source.read(entry)
+                              output.writestr(copy.copy(entry), payload)
+                      temp_path.replace(ipa)
+                  except BaseException:
+                      temp_path.unlink(missing_ok=True)
+                      raise
+
+              print(f"Prepared {ipa.name} for eSign with Bundle ID {expected}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-${{ steps.set-ipa-name.outputs.name }}-${{ inputs.method }}
+          path: |
+            ios-build/out/*.ipa
+            ios-build/out/ipa/*.ipa
+          if-no-files-found: warn

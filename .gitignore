@@ -1,0 +1,18 @@
+# Output cua qua trinh build, khong commit
+ios-build/out/
+DerivedData/
+prepared-projects/
+.ipa-forge-status.json
+.ipa-forge-repo
+.ipa-forge-artifacts/
+completed-artifacts/
+local-tool/.env
+local-tool/__pycache__/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+.DS_Store
+
+# LUU Y: KHONG duoc ignore Libraries/*.a
+# GameAssembly + UnityFramework can 2 file nay de link, chung duoc luu bang Git LFS
+# (xem .gitattributes). Neu ignore hoac bo khoi git thi CI se fail voi loi:
+#   "The source path .../Libraries/libil2cpp.a does not exist."
